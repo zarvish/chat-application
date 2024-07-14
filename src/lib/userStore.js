@@ -1,6 +1,6 @@
-import { doc, getDoc } from "firebase/firestore";
+import { ref, get } from "firebase/database";
 import { create } from "zustand";
-import { db } from "./firebase";
+import { realtimeDb } from "./firebase";
 
 export const useUserStore = create((set) => ({
   currentUser: null,
@@ -9,11 +9,12 @@ export const useUserStore = create((set) => ({
     if (!uid) return set({ currentUser: null, isLoading: false });
 
     try {
-      const docRef = doc(db, "users", uid);
-      const docSnap = await getDoc(docRef);
+      const userRef = ref(realtimeDb, `users/${uid}`);
+      const userSnap = await get(userRef);
 
-      if (docSnap.exists()) {
-        set({ currentUser: docSnap.data(), isLoading: false });
+
+      if (userSnap.exists()) {
+        set({ currentUser: userSnap.val(), isLoading: false });
       } else {
         set({ currentUser: null, isLoading: false });
       }

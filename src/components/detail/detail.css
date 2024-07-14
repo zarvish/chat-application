@@ -1,6 +1,6 @@
 .detail {
   flex: 1;
-
+  overflow-y: auto;
   .user {
     padding: 30px 20px;
     display: flex;

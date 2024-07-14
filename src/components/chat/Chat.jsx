@@ -1,47 +1,61 @@
 import { useEffect, useRef, useState } from "react";
 import "./chat.css";
 import EmojiPicker from "emoji-picker-react";
-import {
-  arrayUnion,
-  doc,
-  getDoc,
-  onSnapshot,
-  updateDoc,
-} from "firebase/firestore";
-import { db } from "../../lib/firebase";
+import { ref, onValue, update, push, set, serverTimestamp } from "firebase/database"; 
+import { realtimeDb } from "../../lib/firebase"; 
 import { useChatStore } from "../../lib/chatStore";
 import { useUserStore } from "../../lib/userStore";
 import upload from "../../lib/upload";
 import { format } from "timeago.js";
 
 const Chat = () => {
-  const [chat, setChat] = useState();
+  const [chat, setChat] = useState(null);
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [img, setImg] = useState({
     file: null,
     url: "",
   });
+  const [onlineUsers, setOnlineUsers] = useState([]);
 
   const { currentUser } = useUserStore();
-  const { chatId, user, isCurrentUserBlocked, isReceiverBlocked } =
-    useChatStore();
+  const { chatId, user, isCurrentUserBlocked, isReceiverBlocked } = useChatStore();
 
   const endRef = useRef(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chat.messages]);
+  }, [chat?.messages]);
 
   useEffect(() => {
-    const unSub = onSnapshot(doc(db, "chats", chatId), (res) => {
-      setChat(res.data());
+    const chatRef = ref(realtimeDb, `chats/${chatId}`);
+    const unSub = onValue(chatRef, (snapshot) => {
+      const data = snapshot.val();
+      setChat(data || { messages: [] }); // Ensure messages is an array
     });
 
     return () => {
       unSub();
     };
   }, [chatId]);
+
+  useEffect(() => {
+    const usersRef = ref(realtimeDb, `users`);
+    const unSub = onValue(usersRef, (snapshot) => {
+      const data = snapshot.val();
+      const onlineUsersList = [];
+      for (const userId in data) {
+        if (data[userId].online) {
+          onlineUsersList.push(data[userId]);
+        }
+      }
+      setOnlineUsers(onlineUsersList);
+    });
+
+    return () => {
+      unSub();
+    };
+  }, []);
 
   const handleEmoji = (e) => {
     setText((prev) => prev + e.emoji);
@@ -67,47 +81,103 @@ const Chat = () => {
         imgUrl = await upload(img.file);
       }
 
-      await updateDoc(doc(db, "chats", chatId), {
-        messages: arrayUnion({
-          senderId: currentUser.id,
-          text,
-          createdAt: new Date(),
-          ...(imgUrl && { img: imgUrl }),
-        }),
-      });
+      const newMessage = {
+        senderId: currentUser.id,
+        text,
+        createdAt: new Date().toISOString(),
+        status: 'sent',
+        ...(imgUrl && { img: imgUrl }),
+      };
+
+      // Update the chat messages under the correct chatId
+      const chatMessagesRef = ref(realtimeDb, `chats/${chatId}/messages`);
+      const newMessageRef = push(chatMessagesRef); // Use push to generate a new key for each message
+      await set(newMessageRef, newMessage);
 
       const userIDs = [currentUser.id, user.id];
 
-      userIDs.forEach(async (id) => {
-        const userChatsRef = doc(db, "userchats", id);
-        const userChatsSnapshot = await getDoc(userChatsRef);
+      // Updating userchats for each user in Realtime Database
+      for (const id of userIDs) {
+        const userChatsRef = ref(realtimeDb, `userchats/${id}`);
+        const userChatsSnapshot = await new Promise((resolve, reject) => {
+          onValue(userChatsRef, (snap) => resolve(snap), reject, { onlyOnce: true });
+        });
 
         if (userChatsSnapshot.exists()) {
-          const userChatsData = userChatsSnapshot.data();
+          const userChatsData = userChatsSnapshot.val();
+          const chatIndex = userChatsData.chats.findIndex((c) => c.chatId === chatId);
 
-          const chatIndex = userChatsData.chats.findIndex(
-            (c) => c.chatId === chatId
-          );
+          if (chatIndex !== -1) {
+            userChatsData.chats[chatIndex].lastMessage = text;
+            userChatsData.chats[chatIndex].isSeen = id === currentUser.id ? true : false;
+            userChatsData.chats[chatIndex].updatedAt = Date.now();
 
-          userChatsData.chats[chatIndex].lastMessage = text;
-          userChatsData.chats[chatIndex].isSeen =
-            id === currentUser.id ? true : false;
-          userChatsData.chats[chatIndex].updatedAt = Date.now();
-
-          await updateDoc(userChatsRef, {
-            chats: userChatsData.chats,
-          });
+            await update(userChatsRef, {
+              chats: userChatsData.chats,
+            });
+          }
         }
-      });
+      }
     } catch (err) {
       console.log(err);
-    } finally{
-    setImg({
-      file: null,
-      url: "",
+    } finally {
+      setImg({
+        file: null,
+        url: "",
+      });
+
+      setText("");
+    }
+  };
+
+  useEffect(() => {
+    const messagesRef = ref(realtimeDb, `chats/${chatId}/messages`);
+    const unSub = onValue(messagesRef, async (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const messageKeys = Object.keys(data);
+        for (const key of messageKeys) {
+          const message = data[key];
+          if (message.senderId !== currentUser.id && message.status === 'sent') {
+            await update(ref(realtimeDb, `chats/${chatId}/messages/${key}`), { status: 'delivered' });
+          }
+        }
+      }
     });
 
-    setText("");
+    return () => {
+      unSub();
+    };
+  }, [chatId, currentUser.id]);
+
+  useEffect(() => {
+    // Set up listener for message status changes to 'read'
+    const messagesRef = ref(realtimeDb, `chats/${chatId}/messages`);
+    const unSub = onValue(messagesRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        Object.keys(data).forEach(async (key) => {
+          const message = data[key];
+          if (message.senderId !== currentUser.id && message.status === 'delivered') {
+            await update(ref(realtimeDb, `chats/${chatId}/messages/${key}`), { status: 'read' });
+          }
+        });
+      }
+    });
+
+    return () => {
+      unSub();
+    };
+  }, [chatId, currentUser.id]);
+
+
+  const handleRead = async (messageId) => {
+    await update(ref(realtimeDb, `chats/${chatId}/messages/${messageId}`), { status: 'read' });
+  };
+
+  const handleMessageClick = (message) => {
+    if (message.senderId !== currentUser.id && message.status !== 'read') {
+      handleRead(message.createdAt);
     }
   };
 
@@ -127,18 +197,25 @@ const Chat = () => {
           <img src="./info.png" alt="" />
         </div>
       </div>
+     
       <div className="center">
-        {chat?.messages?.map((message) => (
+        {!!chat && chat?.messages && Object.values(chat.messages).map((message) => (
           <div
             className={
               message.senderId === currentUser?.id ? "message own" : "message"
             }
-            key={message?.createAt}
+            key={message.createdAt}
+            onClick={() => handleMessageClick(message)}
           >
             <div className="texts">
               {message.img && <img src={message.img} alt="" />}
               <p>{message.text}</p>
-              <span>{format(message.createdAt.toDate())}</span>
+              <span>{format(message.createdAt)}</span>
+              <span className="message-status">
+                {message.status === 'sent' && '✓'}
+                {message.status === 'delivered' && '✓✓'}
+                {message.status === 'read' && '✓✓ (blue)'}
+              </span>
             </div>
           </div>
         ))}

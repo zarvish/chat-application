@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import "./chatList.css";
 import AddUser from "./addUser/addUser";
 import { useUserStore } from "../../../lib/userStore";
-import { doc, getDoc, onSnapshot, updateDoc } from "firebase/firestore";
-import { db } from "../../../lib/firebase";
+import { ref, onValue, update } from "firebase/database";
+import { realtimeDb } from "../../../lib/firebase";
 import { useChatStore } from "../../../lib/chatStore";
+import useUserPresence from "./useUserPresence";
 
 const ChatList = () => {
+  useUserPresence(); // Track user presence
   const [chats, setChats] = useState([]);
   const [addMode, setAddMode] = useState(false);
   const [input, setInput] = useState("");
@@ -15,25 +17,45 @@ const ChatList = () => {
   const { chatId, changeChat } = useChatStore();
 
   useEffect(() => {
-    const unSub = onSnapshot(
-      doc(db, "userchats", currentUser.id),
-      async (res) => {
-        const items = res.data().chats;
+    const userChatsRef = ref(realtimeDb, `userchats/${currentUser.id}`);
+    const unSub = onValue(userChatsRef, async (snapshot) => {
+      const items = snapshot.val()?.chats || [];
+      console.log("items  ", items);
+      // Convert items object to an array of chat objects
+      const itemsArray = Object.entries(items).map(([key, value]) => {
+        console.log("key", key, value);
+        return {
+          chatId: key, // Include the key
+          ...value, // Spread the value object
+        };
+      });
 
-        const promises = items.map(async (item) => {
-          const userDocRef = doc(db, "users", item.receiverId);
-          const userDocSnap = await getDoc(userDocRef);
-
-          const user = userDocSnap.data();
-
-          return { ...item, user };
+      const promises = itemsArray.map(async (item) => {
+        const userRef = ref(realtimeDb, `users/${item.receiverId}`);
+        const userSnapshot = await new Promise((resolve, reject) => {
+          onValue(userRef, (snap) => resolve(snap), reject, { onlyOnce: true });
         });
 
-        const chatData = await Promise.all(promises);
+        const user = userSnapshot.val();
 
-        setChats(chatData.sort((a, b) => b.updatedAt - a.updatedAt));
-      }
-    );
+        // Subscribe to user presence status changes
+        const userStatusRef = ref(realtimeDb, `status/${item.receiverId}`);
+        onValue(userStatusRef, (snapshot) => {
+          setChats((prevChats) =>
+            prevChats.map((chat) =>
+              chat.receiverId === item.receiverId
+                ? { ...chat, status: snapshot.val()?.state }
+                : chat
+            )
+          );
+        });
+
+        return { ...item, user };
+      });
+
+      const chatData = await Promise.all(promises);
+      setChats(chatData.sort((a, b) => b.updatedAt - a.updatedAt));
+    });
 
     return () => {
       unSub();
@@ -51,14 +73,14 @@ const ChatList = () => {
     );
 
     userChats[chatIndex].isSeen = true;
-
-    const userChatsRef = doc(db, "userchats", currentUser.id);
+    const userChatsRef = ref(realtimeDb, `userchats/${currentUser.id}`);
 
     try {
-      await updateDoc(userChatsRef, {
-        chats: userChats,
+      await update(userChatsRef, {
+        chats: userChats, // Update chats in Realtime Database
       });
-      changeChat(chat.chatId, chat.user);
+      console.log("here is chat updated", chat);
+      changeChat(chat.chatId, chat.user); // Update current chat in application state
     } catch (err) {
       console.log(err);
     }
@@ -95,21 +117,12 @@ const ChatList = () => {
             backgroundColor: chat?.isSeen ? "transparent" : "#5183fe",
           }}
         >
-          <img
-            src={
-              chat.user.blocked.includes(currentUser.id)
-                ? "./avatar.png"
-                : chat.user.avatar || "./avatar.png"
-            }
-            alt=""
-          />
+          <img src={chat.user.avatar || "./avatar.png"} alt="" />
           <div className="texts">
-            <span>
-              {chat.user.blocked.includes(currentUser.id)
-                ? "User"
-                : chat.user.username}
+            <span>{chat.user.username}</span>
+            <span className={chat.status === "online" ? "online" : "offline"}>
+              {chat.status === "online" ? "Online" : "Offline"}
             </span>
-            <p>{chat.lastMessage}</p>
           </div>
         </div>
       ))}
